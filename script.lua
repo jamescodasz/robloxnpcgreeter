@@ -1,10 +1,25 @@
-
 --[[
 	NPC Greeter System — ServerScriptService
 
+	When a player joins, the server pulls their friends list and uses those
+	friends' avatars to skin the NPCs. Each NPC wanders around, and when a
+	player gets close enough, it stops, waves, says something, then walks off
+	before going back to normal.
+
+	Each NPC runs through a simple set of states:
+	  Idle      - standing around, waiting before picking somewhere to walk
+	  Wander    - walking toward a chosen point using pathfinding
+	  Greet     - locked into the greeting sequence with a nearby player
+	  WalkAway  - briefly walking off after greeting before going idle again
+
+	The activeGreetings table makes sure only one NPC greets a player at a
+	time. Once an NPC claims a player, no other NPC will try to greet them
+	until that sequence fully finishes.
+
+	Each NPC also runs its own sense loop in a separate thread so the
+	proximity checks are staggered and don't all fire at the same time.
 ]]
 
--- services
 local PathfindingService = game:GetService("PathfindingService")
 local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
@@ -12,204 +27,279 @@ local CollectionService  = game:GetService("CollectionService")
 local ServerStorage      = game:GetService("ServerStorage")
 local Chat               = game:GetService("Chat")
 
--- roblox default Animations
+-- default Roblox animation asset IDs
 local ANIM_IDLE = "rbxassetid://180435571"
 local ANIM_WALK = "rbxassetid://180426354"
 local ANIM_WAVE = "rbxassetid://507770239"
 
--- easy modular tuning
-local NPC_TAG            = "GreeterNPC"
-local NPC_COUNT          = 5
-local NPC_BASE_SPEED     = 12
-local GREET_RADIUS       = 20
-local WANDER_RADIUS      = 40
-local SEPARATION_RADIUS  = 18
-local SENSE_TICK         = 0.15
-local GREET_COOLDOWN     = 15
-local WALK_AWAY_DIST     = 25
-local WALK_AWAY_DURATION = 5
-local IDLE_MIN           = 3
-local IDLE_MAX           = 9
-local SCATTER_RADIUS     = 55
+-- all tuning values are kept here so they're easy to find and adjust
+local NPC_TAG            = "GreeterNPC"   -- tag applied to every NPC model
+local NPC_COUNT          = 5              -- how many NPCs to spawn per player
+local NPC_BASE_SPEED     = 12             -- base walk speed before per-NPC variance
+local GREET_RADIUS       = 20             -- how close a player needs to be to trigger a greeting
+local WANDER_RADIUS      = 40             -- max distance an NPC will wander from its origin
+local SEPARATION_RADIUS  = 18             -- NPCs try to stay at least this far apart when picking wander targets
+local SENSE_TICK         = 0.15           -- seconds between each proximity check per NPC
+local GREET_COOLDOWN     = 15             -- seconds before an NPC can greet again after finishing
+local WALK_AWAY_DIST     = 25             -- how far the NPC walks after finishing a greeting
+local WALK_AWAY_DURATION = 5              -- how long the NPC spends walking away (in seconds)
+local IDLE_MIN           = 3              -- minimum seconds an NPC stands idle before wandering
+local IDLE_MAX           = 9              -- maximum seconds an NPC stands idle before wandering
+local SCATTER_RADIUS     = 55             -- radius around the world origin where NPCs initially spawn
 
-local activeGreetings = {}   -- [player] = true while an NPC is greeting them
+-- tracks which players are currently being greeted so no two NPCs try at once
+local activeGreetings = {}
 
--- rig template
+-- load the rig template once at startup rather than searching for it repeatedly
 local rigTemplate = (function()
 	local folder = ServerStorage:FindFirstChild("NPCAssets")
 	assert(folder, "[GreeterAI] ServerStorage is missing the 'NPCAssets' folder.")
 	local t = folder:FindFirstChild("RigTemplate")
 	assert(t, "[GreeterAI] 'NPCAssets' is missing a model named 'RigTemplate'.")
-	print("[GreeterAI] RigTemplate found ✓")
+	print("[GreeterAI] RigTemplate found.")
 	return t
 end)()
 
--- fetch players friends
+
+-- fetches a player's friends list and returns it shuffled so NPC assignments
+-- feel random each time rather than always showing the same friends first
 local function fetchFriendIds(player)
 	local ids = {}
-	local ok, pages = pcall(function() return Players:GetFriendsAsync(player.UserId) end)
+	local ok, pages = pcall(function()
+		return Players:GetFriendsAsync(player.UserId)
+	end)
 	if not ok or not pages then return ids end
+
 	while true do
-		for _, e in ipairs(pages:GetCurrentPage()) do
-			ids[#ids + 1] = { id = e.Id, name = e.Username }
+		for _, entry in ipairs(pages:GetCurrentPage()) do
+			ids[#ids + 1] = { id = entry.Id, name = entry.Username }
 		end
 		if pages.IsFinished then break end
 		if not pcall(function() pages:AdvanceToNextPageAsync() end) then break end
 	end
-	for i = #ids, 2, -1 do          -- shuffle
+
+	-- shuffle so the same friends don't always appear first
+	for i = #ids, 2, -1 do
 		local j = math.random(1, i)
 		ids[i], ids[j] = ids[j], ids[i]
 	end
+
 	return ids
 end
 
-local function assignFriends(list, count)
-	if #list == 0 then return {} end
-	local out = {}
-	for i = 1, count do out[i] = list[((i-1) % #list) + 1] end
-	return out
+-- distributes friends across the NPC slots by cycling through the list
+-- if there are fewer friends than NPCs, it wraps around and reuses entries
+local function assignFriends(friendList, count)
+	if #friendList == 0 then return {} end
+	local assignments = {}
+	for i = 1, count do
+		assignments[i] = friendList[((i - 1) % #friendList) + 1]
+	end
+	return assignments
 end
 
--- apply the friends avatar to the NPC
+-- applies a friend's avatar to an NPC after a short delay
+-- the delay gives the rig time to fully load into the world first
+-- scales are normalized so all NPCs stay the same size regardless of the friend's body settings
 local function applyFriendAppearance(model, friendEntry)
 	task.spawn(function()
 		task.wait(0.8)
 		local hum = model:FindFirstChildOfClass("Humanoid")
 		if not hum then return end
+
 		local ok, desc = pcall(function()
 			return Players:GetHumanoidDescriptionFromUserIdAsync(friendEntry.id)
 		end)
 		if not ok or not desc then return end
-		desc.BodyTypeScale = 0; desc.HeadScale = 1
-		desc.HeightScale   = 1; desc.WidthScale = 1
-		desc.ProportionScale = 0; desc.DepthScale = 1
+
+		-- force a uniform scale so avatars with unusual body proportions still fit
+		desc.BodyTypeScale   = 0
+		desc.HeadScale       = 1
+		desc.HeightScale     = 1
+		desc.WidthScale      = 1
+		desc.ProportionScale = 0
+		desc.DepthScale      = 1
+
 		pcall(function() hum:ApplyDescription(desc) end)
 	end)
 end
 
--- rig builder
+-- clones the rig template, strips the default Animate script (we handle animations manually),
+-- sets up the Humanoid and Animator, then places it in the world
 local function buildRig(position, npcId, friendEntry)
 	local model = rigTemplate:Clone()
 	model.Name  = "NPC_" .. npcId
 
-	local hum  = model:FindFirstChildOfClass("Humanoid")
-	local root = model:FindFirstChild("HumanoidRootPart")
-	assert(hum  and root, "[GreeterAI] RigTemplate is missing Humanoid or HumanoidRootPart.")
+	local hum      = model:FindFirstChildOfClass("Humanoid")
+	local rootPart = model:FindFirstChild("HumanoidRootPart")
+	assert(hum and rootPart, "[GreeterAI] RigTemplate is missing Humanoid or HumanoidRootPart.")
 
+	-- remove the default Animate script so we can control animations ourselves
 	local animScript = model:FindFirstChild("Animate")
 	if animScript then animScript:Destroy() end
 
+	-- make sure there's an Animator to load tracks through
 	local animator = hum:FindFirstChildOfClass("Animator")
 	if not animator then
 		animator = Instance.new("Animator")
 		animator.Parent = hum
 	end
 
-	hum.MaxHealth             = 100
-	hum.Health                = 100
-	hum.WalkSpeed             = NPC_BASE_SPEED + (math.random() * 4 - 2)
+	hum.MaxHealth               = 100
+	hum.Health                  = 100
+	hum.WalkSpeed               = NPC_BASE_SPEED + (math.random() * 4 - 2) -- slight variance so NPCs don't all feel identical
 	hum.AutomaticScalingEnabled = false
-	hum.DisplayDistanceType   = Enum.HumanoidDisplayDistanceType.None
-	hum.NameDisplayDistance   = 0
-	hum.HealthDisplayDistance = 0
+	hum.DisplayDistanceType     = Enum.HumanoidDisplayDistanceType.None
+	hum.NameDisplayDistance     = 0
+	hum.HealthDisplayDistance   = 0
 
 	model:PivotTo(CFrame.new(position + Vector3.new(0, 3.5, 0)))
 	model.Parent = workspace
 	CollectionService:AddTag(model, NPC_TAG)
 
-	if friendEntry then applyFriendAppearance(model, friendEntry) end
+	if friendEntry then
+		applyFriendAppearance(model, friendEntry)
+	end
 
-	return model, hum, animator, root
+	return model, hum, animator, rootPart
 end
 
--- animation
--- waves are loaded fresh to avoid stale reference
-local function loadBaseAnims(animator)
-	local function load(id, looped)
+
+-- loads the idle and walk animations onto the given Animator and returns them
+-- the wave is intentionally not loaded here because it needs a fresh track each
+-- time it plays to avoid issues with reusing a stopped track
+local function loadBaseAnimations(animator)
+	local function loadTrack(animId, looped)
 		local anim = Instance.new("Animation")
-		anim.AnimationId = id
+		anim.AnimationId = animId
 		local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
-		if ok and track then track.Looped = looped; return track end
+		if ok and track then
+			track.Looped = looped
+			return track
+		end
 	end
+
 	return {
-		idle = load(ANIM_IDLE, true),
-		walk = load(ANIM_WALK, true),
+		idle = loadTrack(ANIM_IDLE, true),
+		walk = loadTrack(ANIM_WALK, true),
 	}
 end
 
+-- stops every track in the given table with a short fade so transitions aren't jarring
 local function stopAllTracks(tracks)
-	for _, t in pairs(tracks) do
-		if t and t.IsPlaying then t:Stop(0.1) end
+	for _, track in pairs(tracks) do
+		if track and track.IsPlaying then
+			track:Stop(0.1)
+		end
 	end
 end
 
-local function playTrack(track, fade)
-	if track and not track.IsPlaying then track:Play(fade or 0.15) end
+-- plays a track only if it isn't already playing, using an optional fade-in time
+local function playTrack(track, fadeTime)
+	if track and not track.IsPlaying then
+		track:Play(fadeTime or 0.15)
+	end
 end
 
--- wander helpers
-local function getAllNPCRoots(selfRoot)
+
+-- collects the HumanoidRootPart of every other NPC in the world
+-- used when picking a wander destination so NPCs avoid clustering together
+local function getOtherNpcRoots(selfRoot)
 	local roots = {}
-	for _, m in ipairs(CollectionService:GetTagged(NPC_TAG)) do
-		local r = m:FindFirstChild("HumanoidRootPart")
-		if r and r ~= selfRoot then roots[#roots + 1] = r end
+	for _, model in ipairs(CollectionService:GetTagged(NPC_TAG)) do
+		local root = model:FindFirstChild("HumanoidRootPart")
+		if root and root ~= selfRoot then
+			roots[#roots + 1] = root
+		end
 	end
 	return roots
 end
 
+-- picks a wander point within WANDER_RADIUS of the origin point
+-- tries 12 candidate points and scores each by how far it is from other NPCs
+-- this keeps NPCs spread out without needing any complex flocking logic
 local function pickWanderPoint(origin, selfRoot)
-	local others = getAllNPCRoots(selfRoot)
-	local best, bestScore = nil, -math.huge
+	local otherRoots = getOtherNpcRoots(selfRoot)
+	local bestPoint, bestScore = nil, -math.huge
+
 	for _ = 1, 12 do
-		local a  = math.random() * math.pi * 2
-		local r  = math.random(8, WANDER_RADIUS)
-		local pt = origin + Vector3.new(math.cos(a)*r, 0, math.sin(a)*r)
-		local minD = math.huge
-		for _, o in ipairs(others) do
-			local d = Vector3.new(pt.X-o.Position.X, 0, pt.Z-o.Position.Z).Magnitude
-			if d < minD then minD = d end
+		local angle     = math.random() * math.pi * 2
+		local dist      = math.random(8, WANDER_RADIUS)
+		local candidate = origin + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+
+		-- find the closest other NPC to this candidate point
+		local closestDist = math.huge
+		for _, root in ipairs(otherRoots) do
+			local flat = Vector3.new(candidate.X - root.Position.X, 0, candidate.Z - root.Position.Z)
+			if flat.Magnitude < closestDist then
+				closestDist = flat.Magnitude
+			end
 		end
-		local score = minD + (minD >= SEPARATION_RADIUS and 60 or 0)
-		if score > bestScore then bestScore = score; best = pt end
+
+		-- bonus score if this point is far enough away to keep separation
+		local score = closestDist + (closestDist >= SEPARATION_RADIUS and 60 or 0)
+		if score > bestScore then
+			bestScore = score
+			bestPoint = candidate
+		end
 	end
-	return best or origin
+
+	return bestPoint or origin
 end
 
-local function computePath(from, to)
+-- runs pathfinding between two positions and returns the waypoints if successful
+-- returns nil if the path fails so callers can fall back gracefully
+local function computePath(fromPos, toPos)
 	local path = PathfindingService:CreatePath({
-		AgentRadius = 2.1, AgentHeight = 5,
-		AgentCanJump = true, WaypointSpacing = 3,
+		AgentRadius  = 2.1,
+		AgentHeight  = 5,
+		AgentCanJump = true,
+		WaypointSpacing = 3,
 	})
-	local ok = pcall(function() path:ComputeAsync(from, to) end)
+
+	local ok = pcall(function() path:ComputeAsync(fromPos, toPos) end)
 	if not ok or path.Status ~= Enum.PathStatus.Success then return nil end
+
 	return path:GetWaypoints()
 end
 
--- npc class
+
+-- NpcClass handles everything about a single NPC: its model, state, animations,
+-- pathfinding, greeting behaviour, and respawning after death
 local NpcClass = {}
 NpcClass.__index = NpcClass
 
 function NpcClass.new(spawnPos, id, friendEntry)
-	local self         = setmetatable({}, NpcClass)
-	self.id            = id
-	self.origin        = spawnPos
-	self.friendEntry   = friendEntry
-	self.state         = "Idle"
-	self.idleTimer     = math.random(IDLE_MIN, IDLE_MAX) + id * 0.6
-	self.naturalSpeed  = NPC_BASE_SPEED + (math.random() * 4 - 2)
-	self.wanderTarget  = nil
-	self.waypoints     = {}
-	self.wpIdx         = 1
-	self.lastPath      = 0
-	self.lastGreet     = -GREET_COOLDOWN
-	self.greetLocked   = false
+	local self = setmetatable({}, NpcClass)
+
+	self.id          = id
+	self.origin      = spawnPos      -- used when picking wander points and for respawning
+	self.friendEntry = friendEntry   -- the friend whose avatar this NPC wears (can be nil)
+	self.state       = "Idle"
+
+	-- stagger idle timers by NPC id so they don't all start wandering simultaneously
+	self.idleTimer    = math.random(IDLE_MIN, IDLE_MAX) + id * 0.6
+	self.naturalSpeed = NPC_BASE_SPEED + (math.random() * 4 - 2)
+
+	-- pathfinding state
+	self.wanderTarget = nil
+	self.waypoints    = {}
+	self.wpIdx        = 1
+
+	-- greeting state
+	self.lastGreet   = -GREET_COOLDOWN  -- start ready to greet immediately
+	self.greetLocked = false             -- true while a greeting sequence is running
+	self.greetPlayer = nil               -- which player is currently being greeted
 
 	self.model, self.hum, self.animator, self.root = buildRig(spawnPos, id, friendEntry)
 	self.hum.WalkSpeed = self.naturalSpeed
-	self.tracks = loadBaseAnims(self.animator)
+	self.tracks = loadBaseAnimations(self.animator)
 
+	-- small delay before playing idle so the rig has settled into the world
 	task.delay(0.3 + id * 0.1, function()
-		if self.hum and self.hum.Health > 0 then playTrack(self.tracks.idle) end
+		if self.hum and self.hum.Health > 0 then
+			playTrack(self.tracks.idle)
+		end
 	end)
 
 	self._deathConn = self.hum.Died:Connect(function() self:onDeath() end)
@@ -219,6 +309,8 @@ function NpcClass.new(spawnPos, id, friendEntry)
 	return self
 end
 
+-- runs in its own thread so each NPC checks for players independently
+-- the small random jitter on the tick prevents all NPCs from firing on the same frame
 function NpcClass:startSenseLoop()
 	self._senseLoop = task.spawn(function()
 		local tick = SENSE_TICK + math.random() * 0.05
@@ -231,103 +323,119 @@ function NpcClass:startSenseLoop()
 	end)
 end
 
--- triger greet within radius
+-- checks every player's distance and claims the first one close enough to greet
+-- the activeGreetings table and greetLocked flag together ensure exclusivity —
+-- only one NPC greets any given player at a time, and this NPC won't try again
+-- until its cooldown has expired
 function NpcClass:sense()
 	if self.greetLocked then return end
 	if os.clock() - self.lastGreet < GREET_COOLDOWN then return end
 	if not self.root or not self.root.Parent then return end
 
 	local myPos = self.root.Position
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if activeGreetings[plr] then continue end
-		local ch = plr.Character
-		if not ch then continue end
-		local pr = ch:FindFirstChild("HumanoidRootPart")
-		local ph = ch:FindFirstChildOfClass("Humanoid")
-		if not pr or not ph or ph.Health <= 0 then continue end
 
-		if (pr.Position - myPos).Magnitude <= GREET_RADIUS then
-			activeGreetings[plr] = true
-			self.greetLocked     = true
-			self.greetPlayer     = plr
-			task.spawn(function() self:runGreetSequence(plr) end)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if activeGreetings[player] then continue end
+
+		local character = player.Character
+		if not character then continue end
+
+		local playerRoot = character:FindFirstChild("HumanoidRootPart")
+		local playerHum  = character:FindFirstChildOfClass("Humanoid")
+		if not playerRoot or not playerHum or playerHum.Health <= 0 then continue end
+
+		if (playerRoot.Position - myPos).Magnitude <= GREET_RADIUS then
+			-- claim this player before spawning the sequence so no race condition occurs
+			activeGreetings[player] = true
+			self.greetLocked        = true
+			self.greetPlayer        = player
+			task.spawn(function() self:runGreetSequence(player) end)
 			break
 		end
 	end
 end
 
--- greet player
-function NpcClass:runGreetSequence(plr)
+-- the full greeting sequence: stop, face the player, wave, chat, walk away, then resume
+-- this runs in its own thread (spawned in sense) so it doesn't block anything else
+function NpcClass:runGreetSequence(player)
 	self.lastGreet = os.clock()
 	self.state     = "Greet"
 
-    -- npc to stop walking
+	-- stop the NPC in place so it doesn't keep wandering during the greeting
 	self.hum.WalkSpeed = 0
 	self.hum:MoveTo(self.root.Position)
 	stopAllTracks(self.tracks)
 	playTrack(self.tracks.idle, 0.1)
 
-	-- face player
-	local pr = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-	if pr and self.root and self.root.Parent then
-		local rp = self.root.Position
-		self.root.CFrame = CFrame.lookAt(rp, Vector3.new(pr.Position.X, rp.Y, pr.Position.Z))
+	-- rotate to face the player (only on the Y axis so the NPC doesn't tilt)
+	local playerRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if playerRoot and self.root and self.root.Parent then
+		local myPos = self.root.Position
+		self.root.CFrame = CFrame.lookAt(
+			myPos,
+			Vector3.new(playerRoot.Position.X, myPos.Y, playerRoot.Position.Z)
+		)
 	end
-
 
 	task.wait(0.2)
 
-
-	local waveAnim       = Instance.new("Animation")
+	-- load and play the wave animation fresh each time to avoid stale track issues
+	local waveAnim = Instance.new("Animation")
 	waveAnim.AnimationId = ANIM_WAVE
-	local waveTrack      = nil
-	local ok, result     = pcall(function()
+
+	local waveTrack
+	local ok, result = pcall(function()
 		return self.animator:LoadAnimation(waveAnim)
 	end)
 	if ok and result then
-		waveTrack         = result
-		waveTrack.Looped  = false
+		waveTrack        = result
+		waveTrack.Looped = false
 		stopAllTracks(self.tracks)
 		waveTrack:Play(0.05)
 	end
-	
-	
+
 	task.wait(0.3)
+
+	-- say something via the in-world chat bubble above the NPC's head
 	local head = self.model and self.model:FindFirstChild("Head")
 	if head then
-		local greeting = "Hello, my friend!"
+		local message = "Hello, my friend!"
 		if self.friendEntry then
-			greeting = "Hey! I'm " .. self.friendEntry.name .. "!"
+			message = "Hey! I'm " .. self.friendEntry.name .. "!"
 		end
-		Chat:Chat(head, greeting, Enum.ChatColor.White)
+		Chat:Chat(head, message, Enum.ChatColor.White)
 	end
 
-	local waited = 0
-	while waited < 4 do
+	-- wait for the wave to finish, but don't wait forever in case the track gets cut short
+	local elapsed = 0
+	while elapsed < 4 do
 		task.wait(0.1)
-		waited = waited + 0.1
+		elapsed = elapsed + 0.1
 		if waveTrack == nil or not waveTrack.IsPlaying then break end
 	end
 
+	-- release the player so other NPCs can greet them again
+	activeGreetings[player] = nil
+	self.greetPlayer        = nil
 
-	activeGreetings[plr] = nil
-	self.greetPlayer     = nil
-
-
-	self.state = "WalkAway"
+	-- walk away in a random direction before resuming idle/wander behaviour
+	self.state         = "WalkAway"
 	self.hum.WalkSpeed = self.naturalSpeed
 
-	local angle = math.random() * math.pi * 2
-	local dest  = self.root.Position
-		+ Vector3.new(math.cos(angle) * WALK_AWAY_DIST, 0, math.sin(angle) * WALK_AWAY_DIST)
+	local angle   = math.random() * math.pi * 2
+	local walkDest = self.root.Position + Vector3.new(
+		math.cos(angle) * WALK_AWAY_DIST,
+		0,
+		math.sin(angle) * WALK_AWAY_DIST
+	)
 
 	stopAllTracks(self.tracks)
 	playTrack(self.tracks.walk, 0.2)
-	self.hum:MoveTo(dest)
+	self.hum:MoveTo(walkDest)
 
 	task.wait(WALK_AWAY_DURATION)
 
-
+	-- only resume if the NPC still exists (it might have died during the walk)
 	if self.model and self.model.Parent then
 		self.state     = "Idle"
 		self.idleTimer = math.random(IDLE_MIN, IDLE_MAX)
@@ -338,152 +446,38 @@ function NpcClass:runGreetSequence(plr)
 	self.greetLocked = false
 end
 
--- path following
+
+-- advances the NPC toward the next waypoint in its current path
+-- waypoints are stepped through one at a time using MoveTo, with a distance
+-- threshold to decide when to move on to the next one
 function NpcClass:followPath()
 	if #self.waypoints == 0 then return end
-	local wp = self.waypoints[self.wpIdx]
-	if not wp then self.waypoints = {}; return end
 
+	local wp = self.waypoints[self.wpIdx]
+	if not wp then
+		self.waypoints = {}
+		return
+	end
+
+	-- compare positions on the XZ plane only to avoid Y-axis throwing off the distance check
 	local myFlat = Vector3.new(self.root.Position.X, 0, self.root.Position.Z)
 	local wpFlat = Vector3.new(wp.Position.X, 0, wp.Position.Z)
+
 	if (wpFlat - myFlat).Magnitude < 3 then
 		self.wpIdx = self.wpIdx + 1
 		wp = self.waypoints[self.wpIdx]
-		if not wp then self.waypoints = {}; return end
+		if not wp then
+			self.waypoints = {}
+			return
+		end
 	end
-	if wp.Action == Enum.PathWaypointAction.Jump then self.hum.Jump = true end
+
+	if wp.Action == Enum.PathWaypointAction.Jump then
+		self.hum.Jump = true
+	end
+
 	self.hum:MoveTo(wp.Position)
 end
 
--- heartbeat update
-function NpcClass:update(dt, now)
-	if not self.model or not self.model.Parent then return end
-	if not self.hum   or self.hum.Health <= 0   then return end
-	if not self.root  or not self.root.Parent    then return end
-
-	if self.greetLocked then return end
-
-	local speed = Vector3.new(
-		self.root.AssemblyLinearVelocity.X, 0,
-		self.root.AssemblyLinearVelocity.Z).Magnitude
-	if speed > 1.2 then
-		if self.tracks.walk and not self.tracks.walk.IsPlaying then
-			stopAllTracks(self.tracks)
-			playTrack(self.tracks.walk, 0.2)
-		end
-	else
-		if self.tracks.idle and not self.tracks.idle.IsPlaying then
-			stopAllTracks(self.tracks)
-			playTrack(self.tracks.idle, 0.3)
-		end
-	end
-
--- idle
-	if self.state == "Idle" then
-		self.idleTimer = self.idleTimer - dt
-		if self.idleTimer <= 0 then
-			local pt       = pickWanderPoint(self.origin, self.root)
-			self.waypoints = computePath(self.root.Position, pt) or {}
-			self.wanderTarget = pt
-			self.wpIdx     = 2
-			self.state     = "Wander"
-		end
-
-	-- wander
-	elseif self.state == "Wander" then
-		if #self.waypoints > 0 then
-			self:followPath()
-			if self.wanderTarget then
-				local flat = Vector3.new(
-					self.wanderTarget.X, self.root.Position.Y, self.wanderTarget.Z)
-				if (flat - self.root.Position).Magnitude < 4 then
-					self.waypoints    = {}
-					self.wanderTarget = nil
-					self.state        = "Idle"
-					self.idleTimer    = math.random(IDLE_MIN, IDLE_MAX)
-					self.hum:MoveTo(self.root.Position)
-				end
-			end
-		else
-			self.state     = "Idle"
-			self.idleTimer = math.random(IDLE_MIN, IDLE_MAX)
-		end
-
-	end
-end
-
--- if the npc dies
-function NpcClass:onDeath()
-	if self.greetPlayer then
-		activeGreetings[self.greetPlayer] = nil
-		self.greetPlayer = nil
-	end
-	self.greetLocked = false
-	if self._deathConn then self._deathConn:Disconnect(); self._deathConn = nil end
-
-	task.delay(5, function()
-		if self.model and self.model.Parent then self.model:Destroy() end
-		self.model = nil; self.hum = nil; self.animator = nil; self.root = nil
-		self.waypoints = {}; self.wpIdx = 1; self.tracks = {}
-
-		self.model, self.hum, self.animator, self.root =
-			buildRig(self.origin, self.id, self.friendEntry)
-		self.hum.WalkSpeed = self.naturalSpeed
-		self.tracks = loadBaseAnims(self.animator)
-		CollectionService:AddTag(self.model, NPC_TAG)
-
-		self._deathConn = self.hum.Died:Connect(function() self:onDeath() end)
-		self:startSenseLoop()
-
-		task.delay(0.3, function()
-			if self.tracks.idle and self.hum and self.hum.Health > 0 then
-				playTrack(self.tracks.idle)
-			end
-		end)
-
-		self.state     = "Idle"
-		self.idleTimer = math.random(IDLE_MIN, IDLE_MAX)
-		print(string.format("[NPC %d] Respawned", self.id))
-	end)
-end
-
-
-local function spawnAllNPCs(assignments)
-	local npcs = {}
-	local step = (math.pi * 2) / NPC_COUNT
-	for i = 1, NPC_COUNT do
-		local angle = step * i + (math.random() - 0.5) * 0.6
-		local dist  = SCATTER_RADIUS * (0.55 + math.random() * 0.45)
-		local pos   = Vector3.new(math.cos(angle)*dist, 0.5, math.sin(angle)*dist)
-		npcs[i]     = NpcClass.new(pos, i, assignments[i])
-		task.wait(0.2)
-	end
-	return npcs
-end
-
-local function startHeartbeat(npcs)
-	RunService.Heartbeat:Connect(function(dt)
-		local now = os.clock()
-		dt = math.min(dt, 0.1)
-		for _, npc in ipairs(npcs) do
-			if npc.model and npc.model.Parent and npc.hum and npc.root then
-				pcall(npc.update, npc, dt, now)
-			end
-		end
-	end)
-end
-
-
-local function onPlayerJoined(player)
-	print(string.format("[GreeterAI v6] %s joined — fetching friends...", player.Name))
-	local list       = fetchFriendIds(player)
-	local assignment = assignFriends(list, NPC_COUNT)
-	local npcs       = spawnAllNPCs(assignment)
-	startHeartbeat(npcs)
-	print(string.format("[GreeterAI v6] %d NPCs active!", NPC_COUNT))
-end
-
-Players.PlayerAdded:Connect(onPlayerJoined)
-for _, plr in ipairs(Players:GetPlayers()) do
-	task.spawn(onPlayerJoined, plr)
-end
+-- called every Heartbeat; handles animation switching and the idle/wander state machine
+-- greetLocked early-out prevents any state changes w
