@@ -480,4 +480,164 @@ function NpcClass:followPath()
 end
 
 -- called every Heartbeat; handles animation switching and the idle/wander state machine
--- greetLocked early-out prevents any state changes w
+-- greetLocked early-out prevents any state changes while a greeting is running
+function NpcClass:update(dt, now)
+	if not self.model or not self.model.Parent then return end
+	if not self.hum   or self.hum.Health <= 0   then return end
+	if not self.root  or not self.root.Parent    then return end
+	if self.greetLocked then return end
+
+	-- switch between walk and idle animations based on actual movement speed
+	local horizontalSpeed = Vector3.new(
+		self.root.AssemblyLinearVelocity.X, 0,
+		self.root.AssemblyLinearVelocity.Z
+	).Magnitude
+
+	if horizontalSpeed > 1.2 then
+		if self.tracks.walk and not self.tracks.walk.IsPlaying then
+			stopAllTracks(self.tracks)
+			playTrack(self.tracks.walk, 0.2)
+		end
+	else
+		if self.tracks.idle and not self.tracks.idle.IsPlaying then
+			stopAllTracks(self.tracks)
+			playTrack(self.tracks.idle, 0.3)
+		end
+	end
+
+	if self.state == "Idle" then
+		-- count down and then kick off a wander once the timer expires
+		self.idleTimer = self.idleTimer - dt
+		if self.idleTimer <= 0 then
+			local target       = pickWanderPoint(self.origin, self.root)
+			self.waypoints     = computePath(self.root.Position, target) or {}
+			self.wanderTarget  = target
+			self.wpIdx         = 2  -- skip waypoint 1, which is always the start position
+			self.state         = "Wander"
+		end
+
+	elseif self.state == "Wander" then
+		if #self.waypoints > 0 then
+			self:followPath()
+
+			-- check if we've arrived close enough to the wander target
+			if self.wanderTarget then
+				local flat = Vector3.new(self.wanderTarget.X, self.root.Position.Y, self.wanderTarget.Z)
+				if (flat - self.root.Position).Magnitude < 4 then
+					self.waypoints    = {}
+					self.wanderTarget = nil
+					self.state        = "Idle"
+					self.idleTimer    = math.random(IDLE_MIN, IDLE_MAX)
+					self.hum:MoveTo(self.root.Position)
+				end
+			end
+		else
+			-- path failed or was empty, just go back to idle and try again later
+			self.state     = "Idle"
+			self.idleTimer = math.random(IDLE_MIN, IDLE_MAX)
+		end
+	end
+end
+
+-- called when the NPC's Humanoid dies
+-- releases any greeting lock it was holding, then respawns the NPC after a delay
+function NpcClass:onDeath()
+	-- if this NPC was mid-greeting, release the player so others can greet them
+	if self.greetPlayer then
+		activeGreetings[self.greetPlayer] = nil
+		self.greetPlayer = nil
+	end
+	self.greetLocked = false
+
+	if self._deathConn then
+		self._deathConn:Disconnect()
+		self._deathConn = nil
+	end
+
+	task.delay(5, function()
+		-- clean up the old model before building a fresh one
+		if self.model and self.model.Parent then
+			self.model:Destroy()
+		end
+
+		self.model     = nil
+		self.hum       = nil
+		self.animator  = nil
+		self.root      = nil
+		self.waypoints = {}
+		self.wpIdx     = 1
+		self.tracks    = {}
+
+		-- rebuild from scratch at the same origin point with the same friend assignment
+		self.model, self.hum, self.animator, self.root =
+			buildRig(self.origin, self.id, self.friendEntry)
+
+		self.hum.WalkSpeed = self.naturalSpeed
+		self.tracks = loadBaseAnimations(self.animator)
+		CollectionService:AddTag(self.model, NPC_TAG)
+
+		self._deathConn = self.hum.Died:Connect(function() self:onDeath() end)
+		self:startSenseLoop()
+
+		task.delay(0.3, function()
+			if self.tracks.idle and self.hum and self.hum.Health > 0 then
+				playTrack(self.tracks.idle)
+			end
+		end)
+
+		self.state     = "Idle"
+		self.idleTimer = math.random(IDLE_MIN, IDLE_MAX)
+		print(string.format("[NPC %d] Respawned.", self.id))
+	end)
+end
+
+
+-- spawns all NPCs in a rough circle around the world origin, slightly randomised
+-- so they don't all line up perfectly. Each gets a staggered 0.2s spawn delay
+-- to reduce the load spike from cloning and loading avatars all at once.
+local function spawnAllNPCs(friendAssignments)
+	local npcs = {}
+	local angleStep = (math.pi * 2) / NPC_COUNT
+
+	for i = 1, NPC_COUNT do
+		local angle = angleStep * i + (math.random() - 0.5) * 0.6
+		local dist  = SCATTER_RADIUS * (0.55 + math.random() * 0.45)
+		local pos   = Vector3.new(math.cos(angle) * dist, 0.5, math.sin(angle) * dist)
+		npcs[i]     = NpcClass.new(pos, i, friendAssignments[i])
+		task.wait(0.2)
+	end
+
+	return npcs
+end
+
+-- hooks the Heartbeat and calls update on every NPC each frame
+-- dt is capped at 0.1 so a lag spike doesn't cause timers to jump drastically
+local function startHeartbeat(npcs)
+	RunService.Heartbeat:Connect(function(dt)
+		local now = os.clock()
+		dt = math.min(dt, 0.1)
+		for _, npc in ipairs(npcs) do
+			if npc.model and npc.model.Parent and npc.hum and npc.root then
+				pcall(npc.update, npc, dt, now)
+			end
+		end
+	end)
+end
+
+
+-- entry point for each player: fetch friends, assign them to NPC slots, spawn, and start updating
+local function onPlayerJoined(player)
+	print(string.format("[GreeterAI] %s joined — fetching friends...", player.Name))
+	local friendList    = fetchFriendIds(player)
+	local assignments   = assignFriends(friendList, NPC_COUNT)
+	local npcs          = spawnAllNPCs(assignments)
+	startHeartbeat(npcs)
+	print(string.format("[GreeterAI] %d NPCs active for %s.", NPC_COUNT, player.Name))
+end
+
+Players.PlayerAdded:Connect(onPlayerJoined)
+
+-- handle any players who were already in the game before this script ran
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerJoined, player)
+end
