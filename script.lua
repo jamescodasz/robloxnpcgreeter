@@ -1,4 +1,5 @@
 --[[
+* I connected my Discord with Github but to credit jamesdoesluau (my discord) and my roblox username jameshasbands
 	NPC Greeter System — ServerScriptService
 
 	When a player joins, the server pulls their friends list and uses those
